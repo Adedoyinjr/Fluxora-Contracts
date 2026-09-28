@@ -69,7 +69,7 @@ pub use accrual::{
 pub use error::Error;
 pub use storage::{MIN_STREAM_TTL_LEDGERS, SECONDS_PER_LEDGER, TTL_BUFFER_SECONDS};
 pub use types::op;
-pub use types::{DataKey, DelegateGrant, Stream, StreamStatus};
+pub use types::{BatchCancelOutcome, DataKey, DelegateGrant, Stream, StreamStatus};
 
 use soroban_sdk::{
     contract, contractimpl, token, Address, Env, InvokeError, MuxedAddress, TryFromVal, Vec,
@@ -637,6 +637,173 @@ impl FluxoraStream {
         let mut stream = storage::load_stream(&env, stream_id)?;
         stream.sender.require_auth();
 
+        let now = env.ledger().timestamp();
+        let (vested_now, refund) = Self::quote_cancel(&stream, now)?;
+        Self::settle_cancel(&env, stream_id, &mut stream, now, vested_now, refund)?;
+        Ok(())
+    }
+
+    /// Cancel several streams at once, refunding each unvested remainder to the
+    /// sender.
+    ///
+    /// All streams must share the same `sender`, who authorizes once for the
+    /// whole batch — the mirror image of [`batch_withdraw`](Self::batch_withdraw)
+    /// and its single `recipient`. Streams need not share a token: each refund
+    /// uses its own stream's token, and the returned total is the sum across
+    /// them, in each token's own smallest unit.
+    ///
+    /// Returns a [`BatchCancelOutcome`]: the total refunded on a settled batch,
+    /// or the position of the stream that refused it.
+    ///
+    /// **Atomicity: the batch is all-or-nothing.** Either every stream in the
+    /// vector is cancelled, or none is. The whole batch is resolved, checked and
+    /// priced before the first storage write, so a batch that fails or refuses
+    /// collapses no schedule, moves no token and emits no `cancelled` event;
+    /// and if a refund transfer is rejected part-way through the commit phase,
+    /// the host discards the writes and transfers already applied alongside it.
+    /// Either way the caller is left free to retry with a corrected id list.
+    ///
+    /// **One instant.** Every refund is priced against a single ledger timestamp
+    /// read once, at the top of the call, and each stream is priced exactly once
+    /// by [`quote_cancel`](Self::quote_cancel). A batch of streams with
+    /// different schedules, cliff positions and pause histories therefore settles
+    /// against one consistent "now" rather than drifting across the vector, and
+    /// the figure a caller sees for one stream in the batch is the same one that
+    /// stream's own `cancel` would have produced at the same instant.
+    ///
+    /// # Refusals are reported by index
+    ///
+    /// A stream that exists and belongs to the caller but cannot be cancelled —
+    /// created with `cancellable == false`, or already `Cancelled` or
+    /// `Depleted` — does not raise a typed `Error`. It refuses the batch and
+    /// names its own position: the returned [`BatchCancelOutcome`] carries
+    /// `refused_index`, the zero-based offset of the **first** such element in
+    /// `stream_ids`, and `refused_reason`, the [`Error`] discriminant that
+    /// explains it ([`Error::NotCancellable`] or [`Error::StreamTerminated`]).
+    /// `refunded` is `0` in that case, because nothing was touched.
+    ///
+    /// The index rides in the return value because a Soroban contract error
+    /// crosses the wire as a bare `u32` discriminant — `Error(Contract, #N)` —
+    /// with no room for a position, and reporting only the *condition* would
+    /// leave a caller holding a 16-id vector with no way to learn which element
+    /// to drop. Everything that can reject the batch as a whole — an unknown id,
+    /// a foreign stream, a duplicate, a batch that is too large — is still a
+    /// plain typed `Error`, exactly as for
+    /// [`batch_withdraw`](Self::batch_withdraw).
+    ///
+    /// Refusals are checked in batch order and reported at the first offending
+    /// index, so the outcome is deterministic for a given vector.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::EmptyBatch`] — no ids were supplied.
+    /// * [`Error::BatchTooLarge`] — more than [`MAX_BATCH_SIZE`] ids. Chunk
+    ///   client-side; the SDK does this automatically.
+    /// * [`Error::MalformedStreamId`] — a serialized vector element is not a
+    ///   `u64`.
+    /// * [`Error::DuplicateStreamId`] — the same id appears twice, which would
+    ///   otherwise operate on a stale copy of the stream the second time.
+    /// * [`Error::StreamNotFound`] — one of the ids does not exist. The whole
+    ///   batch fails, matching [`batch_withdraw`](Self::batch_withdraw), which
+    ///   also does not skip unknown ids.
+    /// * [`Error::Unauthorized`] — one of the streams has a different sender.
+    /// * [`Error::Overflow`] — the refunds do not sum to an `i128`.
+    /// * [`Error::TokenTransferFailed`] — a refund transfer was rejected by the
+    ///   token contract; the whole batch reverts with it.
+    /// * [`Error::TokenMissing`] — a stream's token contract is not registered.
+    pub fn batch_cancel(
+        env: Env,
+        sender: Address,
+        stream_ids: Vec<u64>,
+    ) -> Result<BatchCancelOutcome, Error> {
+        let stream_ids = Self::validate_batch_ids(&env, &stream_ids)?;
+        Self::reject_duplicate_ids(&stream_ids)?;
+        sender.require_auth();
+
+        let now = env.ledger().timestamp();
+        let count = stream_ids.len();
+
+        // Resolve and validate the entire batch before changing storage or
+        // calling any token contract: existence and ownership first, then a
+        // price per stream.
+        let mut streams = Vec::new(&env);
+        for i in 0..count {
+            let stream = storage::peek_stream(&env, stream_ids.get_unchecked(i))?;
+            if stream.sender != sender {
+                return Err(Error::Unauthorized);
+            }
+            streams.push_back(stream);
+        }
+
+        // Price every member at the same instant. The first member that cannot
+        // be cancelled refuses the batch by naming its own index; nothing has
+        // been written yet, so refusing costs the caller nothing but the read
+        // and leaves every stream — and its TTL — exactly as it was.
+        let mut vested = Vec::new(&env);
+        let mut refunds = Vec::new(&env);
+        let mut total: i128 = 0;
+        for i in 0..count {
+            let stream = streams.get_unchecked(i);
+            let quoted = match Self::quote_cancel(&stream, now) {
+                Ok(quoted) => quoted,
+                Err(reason) => {
+                    return Ok(BatchCancelOutcome {
+                        refunded: 0,
+                        refused_index: Some(i),
+                        refused_reason: Some(reason as u32),
+                    })
+                }
+            };
+            total = total.checked_add(quoted.1).ok_or(Error::Overflow)?;
+            vested.push_back(quoted.0);
+            refunds.push_back(quoted.1);
+        }
+
+        // Settle with the figures priced above, not with a second pass over the
+        // clock: the same (vested, refund) pair that was checked above is the
+        // one written and published.
+        for i in 0..count {
+            let stream_id = stream_ids.get_unchecked(i);
+            let mut stream = streams.get_unchecked(i);
+            Self::settle_cancel(
+                &env,
+                stream_id,
+                &mut stream,
+                now,
+                vested.get_unchecked(i),
+                refunds.get_unchecked(i),
+            )?;
+        }
+
+        Ok(BatchCancelOutcome {
+            refunded: total,
+            refused_index: None,
+            refused_reason: None,
+        })
+    }
+
+    /// Check the preconditions and price a cancellation of `stream` at `now`.
+    ///
+    /// Returns `(vested_now, refund)`: the total vested at that instant —
+    /// cumulative and inclusive of `withdrawn` — and the unvested remainder
+    /// handed back to the sender.
+    ///
+    /// Pure: it reads no storage and calls no token contract. That is what lets
+    /// [`batch_cancel`](Self::batch_cancel) price every member of a batch at one
+    /// shared instant, and decide whether to commit at all, before anything is
+    /// written. It is the read half of [`settle_cancel`](Self::settle_cancel),
+    /// which is the only place that mutates a stream on this path, so a
+    /// single-stream cancel and the same stream inside a batch cannot drift
+    /// apart.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::NotCancellable`] — created with `cancellable == false`.
+    /// * [`Error::StreamTerminated`] — already cancelled or depleted. Checked
+    ///   after the flag, so a non-cancellable stream that is also terminal
+    ///   reports `NotCancellable`, matching [`cancel`](Self::cancel).
+    /// * [`Error::Overflow`] — the accrual arithmetic does not fit in `i128`.
+    fn quote_cancel(stream: &Stream, now: u64) -> Result<(i128, i128), Error> {
         if !stream.cancellable {
             return Err(Error::NotCancellable);
         }
@@ -644,10 +811,38 @@ impl FluxoraStream {
             return Err(Error::StreamTerminated);
         }
 
-        let now = env.ledger().timestamp();
-        let vested_now = accrual::vested(&stream, now)?;
-        let refund = accrual::refundable(&stream, now)?;
+        let vested_now = accrual::vested(stream, now)?;
+        let refund = accrual::refundable(stream, now)?;
+        Ok((vested_now, refund))
+    }
 
+    /// Collapse `stream` onto `now` and pay `refund` back to its sender.
+    ///
+    /// The write half of [`quote_cancel`](Self::quote_cancel), taking the
+    /// figures that helper already priced at that instant. Both
+    /// [`cancel`](Self::cancel) and [`batch_cancel`](Self::batch_cancel) go
+    /// through here, so the schedule rewrite, the refund transfer and the
+    /// `cancelled` event are identical whether a stream is cancelled alone or
+    /// as one member of a batch. `now` is threaded through rather than read from
+    /// the ledger so a batch cannot settle member *n* at a later instant than
+    /// member *n - 1*.
+    ///
+    /// A zero refund (nothing unvested — a stream cancelled at or after its
+    /// end) issues no transfer at all, per the zero-value policy in
+    /// `docs/ABI.md`.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::TokenTransferFailed`] — the refund transfer was rejected.
+    /// * [`Error::TokenMissing`] — the stream's token contract is not registered.
+    fn settle_cancel(
+        env: &Env,
+        stream_id: u64,
+        stream: &mut Stream,
+        now: u64,
+        vested_now: i128,
+        refund: i128,
+    ) -> Result<(), Error> {
         // Issue #1584 — the accounting the `Cancelled` event publishes.
         //
         // `vested_now` is the *total* vested at this instant, cumulative and
@@ -655,7 +850,8 @@ impl FluxoraStream {
         // back to the sender. Conservation (invariant I4) says the two must
         // partition the pre-cancel deposit exactly, with nothing created or
         // destroyed in between. Checked here rather than trusted, because this
-        // is the identity every downstream ledger reconciles against.
+        // is the identity every downstream ledger reconciles against, and the
+        // test suite now runs it for every member of a batch too.
         //
         // `debug_assert` compiles out of the release profile
         // (`debug-assertions = false`), so this costs the deployed contract
@@ -673,7 +869,7 @@ impl FluxoraStream {
         // Collapse the schedule onto the current point of the stream clock.
         // Clamped at `start_time` so a cancel before the stream opens leaves a
         // zero-length (not negative-length) schedule.
-        let settle_at = accrual::stream_time(&stream, now).max(stream.start_time);
+        let settle_at = accrual::stream_time(stream, now).max(stream.start_time);
 
         stream.deposited = vested_now;
         stream.end_time = settle_at;
@@ -682,11 +878,11 @@ impl FluxoraStream {
 
         let token = stream.token.clone();
         let sender = stream.sender.clone();
-        storage::save_stream(&env, stream_id, &stream);
+        storage::save_stream(env, stream_id, stream);
 
         if refund > 0 {
             token_transfer(
-                &env,
+                env,
                 &token,
                 &env.current_contract_address(),
                 MuxedAddress::from(sender),
@@ -698,7 +894,7 @@ impl FluxoraStream {
         // the helper (`stream.deposited`, set above), so it cannot disagree with
         // storage. Asserted here so the intent survives a future edit.
         debug_assert_eq!(stream.deposited, vested_now);
-        events::cancelled(&env, stream_id, &stream, refund);
+        events::cancelled(env, stream_id, stream, refund);
         Ok(())
     }
 

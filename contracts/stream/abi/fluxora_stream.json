@@ -2,6 +2,15 @@
   "abi_version": 1,
   "functions": [
     {
+      "name": "batch_cancel",
+      "auth": "sender",
+      "inputs": [
+        {"name": "sender", "type": "Address"},
+        {"name": "stream_ids", "type": "Vec<u64>"}
+      ],
+      "outputs": "Result<BatchCancelOutcome, Error>"
+    },
+    {
       "name": "batch_extend_ttl",
       "auth": "none",
       "inputs": [
@@ -222,6 +231,17 @@
     }
   ],
   "types": [
+    {
+      "name": "BatchCancelOutcome",
+      "kind": "struct",
+      "fields": [
+        {"name": "refunded", "type": "i128"},
+        {"name": "refused_index", "type": "Option<u32>"},
+        {"name": "refused_reason", "type": "Option<u32>"}
+      ],
+      "cases": [
+      ]
+    },
     {
       "name": "Stream",
       "kind": "struct",

@@ -94,9 +94,12 @@ least as well in v1, or dropped for a reason traceable to a v1 non-goal.
 ## 3. Behaviour deliberately removed
 
 The old contract set exposed **145 entrypoints** (100 stream, 16 factory, 29
-governance). v1 exposes **16** core entrypoints plus **8 delegation entrypoints**
+governance). v1 exposes **17** core entrypoints plus **8 delegation entrypoints**
 (`grant_delegate`, `revoke_delegate`, and the six `delegate_*` variants) for a
-total of **24**. The delegates are gated on per-operation grants
+total of **25**. `batch_cancel` joined the core surface after this document was
+written: a programme is wound down in one call, with a member that cannot be
+cancelled reported by its index in the submitted vector. The delegates are gated
+on per-operation grants
 (`docs/delegation-revocation.md`) and do not change the core surface the
 renames table below maps. Grouped by why:
 

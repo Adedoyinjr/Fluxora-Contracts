@@ -54,6 +54,11 @@ fn entrypoint_cost_snapshot() {
     record(&h, "cancel");
 
     let (h, id) = fresh();
+    h.advance(10 * DAY);
+    h.client.batch_cancel(&h.sender, &h.ids(&[id]));
+    record(&h, "batch_cancel");
+
+    let (h, id) = fresh();
     h.client.pause(&id);
     record(&h, "pause");
 

@@ -36,7 +36,7 @@ use crate::events::{
     Cancelled, Paused, RecipientTransferred, Resumed, StreamCreated, ToppedUp, TtlExtended,
     Withdrawn,
 };
-use crate::{Error, FluxoraStream, Stream, StreamStatus, ABI_VERSION};
+use crate::{BatchCancelOutcome, Error, FluxoraStream, Stream, StreamStatus, ABI_VERSION};
 
 // ---------------------------------------------------------------------------
 // Inventory
@@ -95,6 +95,7 @@ const AUTH: &[(&str, &str)] = &[
     ("create_stream", "sender"),
     ("top_up", "sender"),
     ("cancel", "sender"),
+    ("batch_cancel", "sender"),
     ("pause", "sender"),
     ("resume", "sender"),
     ("withdraw", "recipient"),
@@ -279,6 +280,7 @@ fn current_inventory() -> Inventory {
         function_from_spec(parse_spec(&FluxoraStream::spec_xdr_withdraw())),
         function_from_spec(parse_spec(&FluxoraStream::spec_xdr_batch_withdraw())),
         function_from_spec(parse_spec(&FluxoraStream::spec_xdr_cancel())),
+        function_from_spec(parse_spec(&FluxoraStream::spec_xdr_batch_cancel())),
         function_from_spec(parse_spec(&FluxoraStream::spec_xdr_pause())),
         function_from_spec(parse_spec(&FluxoraStream::spec_xdr_resume())),
         function_from_spec(parse_spec(&FluxoraStream::spec_xdr_transfer_recipient())),
@@ -304,6 +306,7 @@ fn current_inventory() -> Inventory {
     functions.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut types = vec![
+        type_from_spec(parse_spec(&BatchCancelOutcome::spec_xdr())),
         type_from_spec(parse_spec(&Stream::spec_xdr())),
         type_from_spec(parse_spec(&StreamStatus::spec_xdr())),
     ];
