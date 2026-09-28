@@ -53,6 +53,8 @@ mod withdraw_cancel_same_ledger;
 mod accounting_identity;
 mod accrual_overflow;
 mod batch;
+// Issue #1811: bounded batch cancellation, reported by index on refusal.
+mod batch_cancel;
 mod entrypoint_costs;
 mod invariants;
 mod lifecycle_proptest;

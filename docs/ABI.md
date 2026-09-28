@@ -340,6 +340,7 @@ accounting.
 | `withdraw(stream_id, amount: Option<i128>)` | recipient | `i128` paid — [details](#withdraw) |
 | `batch_withdraw(recipient, stream_ids: Vec<u64>)` | recipient | `i128` total |
 | `cancel(stream_id)` | sender | — |
+| `batch_cancel(sender, stream_ids: Vec<u64>)` | sender | `BatchCancelOutcome` — [details](#batch_cancelsender-stream_ids-vecu64) |
 | `pause(stream_id)` / `resume(stream_id)` | sender | — |
 | `transfer_recipient(stream_id, new_recipient)` | recipient | — |
 | `revoke_delegate(stream_id, grantor, delegate)` | sender or recipient | — |
@@ -664,6 +665,115 @@ the host before a typed error is produced.
 `sender`; payload `amount` (this top-up), `deposited` (total after the call),
 and `end_time` (extended schedule end). The token contract also emits its own
 `transfer` event for the deposit.
+#### `batch_cancel(sender, stream_ids: Vec<u64>)`
+
+```rust
+fn batch_cancel(env: Env, sender: Address, stream_ids: Vec<u64>) -> Result<BatchCancelOutcome, Error>
+```
+
+Winds down several cancellable streams in one call, refunding each stream's
+unvested remainder to `sender`. The batch counterpart of `cancel`, and the mirror
+of `batch_withdraw`: one shared party, one authorization for the whole vector,
+and the same all-or-nothing failure model.
+
+The return value is a struct, not a bare `i128`:
+
+```rust
+pub struct BatchCancelOutcome {
+    pub refunded: i128,          // total refunded across the batch
+    pub refused_index: Option<u32>,  // position in `stream_ids` that refused
+    pub refused_reason: Option<u32>,  // an `Error` discriminant
+}
+```
+
+A settled batch has `refused_index == None` and reports the total `refunded`. A
+refused batch has `refunded == 0` and names the element that stopped it.
+
+##### Parameters
+
+| parameter | type | valid range / constraints |
+|---|---|---|
+| `sender` | `Address` | The account that authorises the call and receives every refund. It is compared **by value** against each `Stream.sender`; the batch is rejected with `Unauthorized` (7) unless all of them match. A failed signature surfaces as a host authentication failure, not a typed `Error`. |
+| `stream_ids` | `Vec<u64>` | **1 to `MAX_BATCH_SIZE` (16) elements**, inclusive — the same ceiling and the same derivation as `batch_withdraw`: the binding constraint is the contract event budget, not entry or instruction counts. A cap-sized `batch_cancel` settles in 8 832 of 16 384 event bytes (~552 bytes per element, one `cancelled` event plus one token `transfer`), so the event budget alone would allow ~29 streams in a batch; the 16 cap leaves room but not the same 2x margin `batch_withdraw` has on that dimension (`test::resource_limits`). Every element must decode as a `u64` (`MalformedStreamId` otherwise) and name a distinct existing stream in `0..stream_count()` (`StreamNotFound` otherwise). Empty → `EmptyBatch`; more than 16 → `BatchTooLarge`; a repeated id → `DuplicateStreamId`. |
+
+##### Authorisation
+
+`sender.require_auth()` — the sender authorises **once** for the whole batch,
+after the structural checks and before any storage write. The recipient cannot
+call it, and neither can any other party.
+
+##### Per-element behaviour
+
+1. The batch is *resolved and validated in full* before any storage write or
+   token call: existence, then ownership, then a price per element.
+2. Every refund is priced against a **single ledger timestamp**, read once at the
+   top of the call, and each stream is priced exactly once. Members with
+   different deposits, durations, cliffs and pause histories therefore settle
+   against one consistent "now" rather than drifting across the vector.
+3. Streams need not share a token; each refund uses its own stream's token. The
+   returned `refunded` is therefore a sum of amounts in different tokens — read
+   per-stream figures from the `cancelled` events, not from the total.
+4. An element with **nothing unvested** (already fully vested) still settles: it
+   becomes `Cancelled`, and **no token transfer is issued** for it.
+
+##### Refusals are reported by index
+
+A stream that exists, belongs to `sender`, but cannot be cancelled — created with
+`cancellable = false`, or already `Cancelled` or `Depleted` — does **not** raise
+a typed `Error`. It refuses the batch and reports its own position:
+
+| field | value on a refusal |
+|---|---|
+| `refused_index` | zero-based offset in `stream_ids` of the **first** element that refused |
+| `refused_reason` | `NotCancellable` (8) or `StreamTerminated` (14) — which of the two conditions stopped that element |
+| `refunded` | `0` — a refused batch changes nothing |
+
+Elements are checked in batch order, so the report is deterministic for a given
+vector: with two pinned streams in the batch, the earlier position is always the
+one named. Dropping that element and resubmitting settles the rest.
+
+**Why the index is not in the error.** A Soroban contract error crosses the wire
+as a bare `u32` discriminant — `Error(Contract, #N)` — and `#[contracterror]`
+enums can only carry unit variants, so no typed error can transport a position
+alongside a discriminant. Reporting only the condition would leave a caller
+holding a 16-id vector with no way to learn *which* element to drop, and a second
+round-trip over the whole vector to find out. The index is data, so it travels
+in the data.
+
+##### Atomicity
+
+All-or-nothing, and stricter than `batch_withdraw` in one respect: there are no
+skips. Either every element is settled — each schedule collapsed, each refund
+paid, each `cancelled` event emitted — or none is. A refused or failed batch
+writes no storage, moves no tokens, extends no TTL, and emits no event, including
+for elements that had already been processed by the time the refusal was found.
+
+##### Events
+
+* One `cancelled` event **per stream**, in batch order, with topics `stream_id`,
+  `sender`, `recipient` and payload `refunded`, `vested`, `deposited`, `status`
+  — the same payload a single `cancel` publishes.
+* There is no aggregate or batch-level event; the return value is the only total.
+* Each non-zero refund also triggers the token contract's own `transfer` event.
+
+##### Failure modes
+
+| error | # | condition |
+|---|---|---|
+| `StreamNotFound` | 1 | An id in `stream_ids` does not exist, or has been archived out of the live ledger. As with `batch_withdraw`, unknown ids fail the batch rather than being skipped. |
+| `Unauthorized` | 7 | A resolved stream's `sender` differs from the `sender` argument. |
+| `BatchTooLarge` | 19 | `stream_ids.len() > MAX_BATCH_SIZE` (16). |
+| `EmptyBatch` | 20 | `stream_ids` contains no elements. |
+| `DuplicateStreamId` | 21 | The same id appears more than once in the batch. |
+| `Overflow` | 22 | Checked arithmetic overflows while accruing a stream's figures or summing the batch total. |
+| `TokenTransferFailed` | 25 | A refund's token transfer was rejected by the token contract. The raw token discriminant is discarded — see the `Error` table above. |
+| `TokenMissing` | 26 | A refund's token address does not resolve to a deployed contract (host `Abort`). No funds moved. |
+| `MalformedStreamId` | 29 | A serialized element of `stream_ids` does not decode as a `u64`. |
+
+`NotCancellable` (8) and `StreamTerminated` (14) are reachable only as
+`BatchCancelOutcome::refused_reason`, never as a returned `Error`: a caller sees
+them as data, with the index attached, rather than as a failure of the call.
+
 #### `cancel(stream_id)`
 
 Stops accrual and refunds the unvested remainder to the sender. The recipient keeps everything vested up to the current ledger timestamp.

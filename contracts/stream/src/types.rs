@@ -29,6 +29,38 @@ pub struct DelegateGrant {
     pub expires_at: Option<u64>,
 }
 
+/// What one `batch_cancel` call did.
+///
+/// A batch is all-or-nothing, so this has exactly two shapes: the whole vector
+/// settled, in which case `refused_index` and `refused_reason` are `None` and
+/// `refunded` is the total handed back to the sender; or nothing was touched,
+/// in which case `refunded` is `0` and the two `refused_*` fields name the
+/// stream that stopped the batch.
+///
+/// The refusal travels in the return value rather than in a typed `Error`
+/// because a Soroban contract error crosses the wire as a bare `u32`
+/// discriminant (`Error(Contract, #N)`) with no room for a position. The
+/// caller learns which element to drop, and why, without re-reading the whole
+/// batch.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchCancelOutcome {
+    /// Total refunded to the sender by this call, in the smallest unit of each
+    /// stream's own token. Always `0` when `refused_index` is `Some`, because a
+    /// refused batch changes nothing.
+    pub refunded: i128,
+
+    /// Zero-based position in the submitted vector of the first stream that
+    /// could not be cancelled. `None` when the batch settled.
+    pub refused_index: Option<u32>,
+
+    /// Discriminant of the [`crate::Error`] that stopped that stream:
+    /// `NotCancellable` (8) for a stream created with `cancellable == false`,
+    /// `StreamTerminated` (14) for one already `Cancelled` or `Depleted`.
+    /// `None` when the batch settled.
+    pub refused_reason: Option<u32>,
+}
+
 /// Lifecycle state of a stream.
 ///
 /// `Cancelled` and `Depleted` are both terminal and both imply
