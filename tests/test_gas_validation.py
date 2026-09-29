@@ -10,6 +10,7 @@ def test_entrypoints_match_public_abi_surface():
     names = entrypoints()
     assert len(names) == 25
     assert {"withdraw", "batch_withdraw", "batch_cancel", "delegate_withdraw"} <= names
+    assert {"withdraw", "batch_withdraw", "delegate_withdraw"} <= names
 
 
 def test_parse_measurements_reads_entrypoint_costs():

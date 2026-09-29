@@ -58,6 +58,11 @@ compile_error!("Fluxora production WASM must not enable the testutils feature.")
 extern crate std;
 
 mod accrual;
+#[cfg(test)]
+mod checksum;
+#[cfg(test)]
+mod protocol_limits;
+mod token_check;
 mod error;
 mod events;
 mod storage;
@@ -67,9 +72,13 @@ pub use accrual::{
     cliff_reached, duration, elapsed, liability, refundable, stream_time, vested, withdrawable,
 };
 pub use error::Error;
-pub use storage::{MIN_STREAM_TTL_LEDGERS, SECONDS_PER_LEDGER, TTL_BUFFER_SECONDS};
+pub use storage::{
+    MIN_STREAM_TTL_LEDGERS, SECONDS_PER_LEDGER, TTL_BUFFER_SECONDS, TTL_SAFETY_MARGIN_PERCENT,
+};
 pub use types::op;
 pub use types::{BatchCancelOutcome, DataKey, DelegateGrant, Stream, StreamStatus};
+pub use types::{CliffMode, DataKey, DelegateGrant, Stream, StreamStatus};
+pub use types::{DataKey, DelegateGrant, Stream, StreamStatus, MAX_REFERENCE_LENGTH};
 
 use soroban_sdk::{
     contract, contractimpl, token, Address, Env, InvokeError, MuxedAddress, TryFromVal, Vec,
@@ -118,7 +127,21 @@ pub const MAX_BATCH_SIZE: u32 = 16;
 ///
 /// The on-chain contract is immutable, so a bump is a *new deployment*, not an
 /// in-place upgrade. See `docs/ABI.md` and `test::abi`.
-pub const ABI_VERSION: u32 = 1;
+///
+/// # v2 — wall-clock cliff
+///
+/// Bumped for the one breaking change in this release: the `Stream` UDT gained
+/// a `cliff_mode` field, which `test::abi` classifies as `type-changed UDT` and
+/// therefore refuses without a version bump. `StreamCreated` also gained a
+/// trailing `cliff_mode` payload field, and `create_stream_with_cliff_mode` a
+/// new method — both additive on their own.
+///
+/// `create_stream`'s signature is deliberately **unchanged**, so v1 callers need
+/// no migration: it now delegates with [`CliffMode::DEFAULT`]. `Stream` gaining
+/// a field is only a break for a caller that *constructs* a `Stream` locally;
+/// readers and indexers decode it from storage or an event, both of which carry
+/// the new field explicitly.
+pub const ABI_VERSION: u32 = 2;
 
 /// Call `token.transfer(from, to, amount)` and map any failure to a stable
 /// stream-level error.
@@ -229,6 +252,53 @@ impl FluxoraStream {
     /// Returns the new stream id. The id is monotonic and never reused, so it is
     /// a stable handle for an indexer.
     ///
+    /// This is [`CliffMode::Schedule`]: the cliff is a point on the stream
+    /// clock, so pausing a `pausable` stream before its cliff defers the gate.
+    /// Callers who need a cliff that pausing cannot move — a contractual date —
+    /// want [`create_stream_with_cliff_mode`](Self::create_stream_with_cliff_mode).
+    ///
+    /// Every parameter, the accrual semantics, and the error set are otherwise
+    /// identical between the two entry points; this one delegates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_stream(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        deposit: i128,
+        start_time: u64,
+        end_time: u64,
+        cliff_time: u64,
+        cancellable: bool,
+        pausable: bool,
+        transferable: bool,
+    ) -> Result<u64, Error> {
+        Self::create_stream_with_cliff_mode(
+            env,
+            sender,
+            recipient,
+            token,
+            deposit,
+            start_time,
+            end_time,
+            cliff_time,
+            CliffMode::DEFAULT,
+            cancellable,
+            pausable,
+            transferable,
+        )
+    }
+
+    /// Create a stream, choosing which clock the cliff gate is read against.
+    ///
+    /// Returns the new stream id. The id is monotonic and never reused, so it is
+    /// a stable handle for an indexer.
+    ///
+    /// Identical to [`create_stream`](Self::create_stream) except for the
+    /// `cliff_mode` parameter. Prefer this one when the caller has an opinion
+    /// about pausing; prefer `create_stream` when it does not, since
+    /// [`CliffMode::Schedule`] is the default and the long-standing behaviour.
+    ///
     /// # Schedule
     ///
     /// Tokens accrue linearly from `start_time` to `end_time`. `start_time` may
@@ -251,11 +321,37 @@ impl FluxoraStream {
     /// does for any multi-year stream. The regression tests in `test/create.rs`
     /// pin these semantics.
     ///
+    /// # The cliff gate
+    ///
     /// `cliff_time` **gates** the payout, it does not delay accrual. Pass
     /// `cliff_time == start_time` for no cliff. At the cliff instant the
     /// recipient becomes entitled to everything accrued since `start_time`, not
     /// merely what accrues after the cliff. This is standard vesting semantics
     /// and it surprises people, so it is worth restating in any UI.
+    ///
+    /// `cliff_mode` decides which clock that instant is read against, and so
+    /// whether pausing can move it. `cliff_time` is validated against
+    /// `[start_time, end_time]` in both modes, and is fixed at creation either
+    /// way.
+    ///
+    /// * [`CliffMode::Schedule`] (the default) — gate at `cliff_time` on the
+    ///   stream clock, so pausing freezes it and resuming pushes the wall-clock
+    ///   opening instant forward by the total paused duration.
+    /// * [`CliffMode::WallClock`] — gate at `cliff_time` on the ledger clock.
+    ///   Pausing never moves it. Pausing still stops *accrual*, so a stream
+    ///   paused before its cliff opens the gate on schedule and pays out only
+    ///   what had accrued when it was paused.
+    ///
+    /// The mode is a term of the stream, fixed at creation and never mutable —
+    /// the same trust property as `cancellable` / `pausable` / `transferable`.
+    /// A recipient can therefore read `cliff_mode` and know exactly which
+    /// reading of `cliff_time` applies. It is published by
+    /// `stream_created` and readable from `get_stream`.
+    ///
+    /// Choose `WallClock` when `cliff_time` is a contractual date the recipient
+    /// is entitled to hold you to; choose `Schedule` when the cliff is a
+    /// milestone in your own schedule and stretching it alongside the schedule
+    /// is the intent. Neither mode changes the total value delivered.
     ///
     /// # Errors
     ///
@@ -279,7 +375,7 @@ impl FluxoraStream {
     ///   different amount than `deposit` (a fee-on-transfer or rebasing
     ///   token). See `docs/ABI.md` "Token assumptions".
     #[allow(clippy::too_many_arguments)]
-    pub fn create_stream(
+    pub fn create_stream_with_cliff_mode(
         env: Env,
         sender: Address,
         recipient: Address,
@@ -288,9 +384,11 @@ impl FluxoraStream {
         start_time: u64,
         end_time: u64,
         cliff_time: u64,
+        cliff_mode: CliffMode,
         cancellable: bool,
         pausable: bool,
         transferable: bool,
+        reference: Option<String>,
     ) -> Result<u64, Error> {
         sender.require_auth();
 
@@ -305,6 +403,13 @@ impl FluxoraStream {
         }
         if cliff_time < start_time || cliff_time > end_time {
             return Err(Error::InvalidCliff);
+        }
+
+        // Validate reference length if provided
+        if let Some(ref r) = reference {
+            if r.len() > MAX_REFERENCE_LENGTH as usize {
+                return Err(Error::InvalidReferenceLength);
+            }
         }
 
         let total_duration = end_time - start_time;
@@ -335,12 +440,14 @@ impl FluxoraStream {
             start_time,
             end_time,
             cliff_time,
+            cliff_mode,
             cancellable,
             pausable,
             transferable,
             paused_at: None,
             paused_total: 0,
             status: StreamStatus::Active,
+            reference,
         };
 
         // Pull the deposit before writing the stream entry. If the token
@@ -1491,11 +1598,40 @@ impl FluxoraStream {
     /// Multi-year streams need this periodically no matter how generously the
     /// contract extends at creation, because no entry may exceed the network's
     /// `max_entry_ttl`.
+    ///
+    /// # Terminal streams
+    ///
+    /// **Extending the TTL of a `Cancelled` or `Depleted` stream is rejected
+    /// with [`Error::StreamTerminated`].** Terminal streams have settled all
+    /// accounting and no future state change is possible. Their entries decay
+    /// from the floor set at cancellation/depletion to zero under normal Soroban
+    /// rent rules; the caller should not pay indefinitely for a record that will
+    /// never change. Keeping terminal records accessible is only necessary while
+    /// a recipient still has an unwithdrawn tail (which is the `Cancelled` but
+    /// not-yet-drained case) — that window is covered by the floor TTL the
+    /// contract applies at the time of cancellation/depletion. If the entry has
+    /// since archived, it must be restored via a `RestoreFootprint` operation
+    /// rather than extended.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::StreamNotFound`] — no stream with this id.
+    /// * [`Error::StreamTerminated`] — stream is `Cancelled` or `Depleted`.
     pub fn extend_stream_ttl(env: Env, stream_id: u64) -> Result<u32, Error> {
         // Authorization: permissionless by design — see doc comment. Any caller
         // may pay rent for any stream. The caller has no address parameter and
         // no `require_auth` is invoked.
         let stream = storage::peek_stream(&env, stream_id)?;
+
+        // Terminal streams (Cancelled, Depleted) have settled all accounting.
+        // Reject the extension so callers are not silently charged indefinite
+        // rent for a record that can no longer change. The floor TTL applied at
+        // the time of cancellation/depletion covers the withdrawal tail; after
+        // that the entry may archive and must be restored via RestoreFootprint.
+        if stream.status.is_terminal() {
+            return Err(Error::StreamTerminated);
+        }
+
         let target = storage::ttl_target_ledgers(&env, &stream);
         storage::extend_stream(&env, stream_id, &stream);
         storage::extend_instance(&env);
@@ -1515,6 +1651,26 @@ impl FluxoraStream {
     /// [`Error::DuplicateStreamId`] rather than attempting to extend it twice.
     /// Empty, oversized, and malformed vectors are rejected before the sweep
     /// starts. Returns how many entries were actually extended.
+    ///
+    /// # Terminal streams
+    ///
+    /// **Any `Cancelled` or `Depleted` stream in the batch causes the entire
+    /// call to fail with [`Error::StreamTerminated`].** This mirrors the single
+    /// entry-point policy in [`extend_stream_ttl`](Self::extend_stream_ttl) and
+    /// ensures both paths enforce the same rule: callers may not extend the TTL
+    /// of a settled stream. A keeper sweep should filter out terminal stream ids
+    /// before submitting a batch; the indexer's `status` field is the signal.
+    ///
+    /// Unknown ids continue to be skipped — a stale index entry for a stream
+    /// that does not exist (or has archived) does not abort the sweep.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::EmptyBatch`] — no ids provided.
+    /// * [`Error::BatchTooLarge`] — more than [`MAX_BATCH_SIZE`] ids.
+    /// * [`Error::MalformedStreamId`] — an element is not a valid `u64`.
+    /// * [`Error::DuplicateStreamId`] — the same id appears more than once.
+    /// * [`Error::StreamTerminated`] — at least one id is `Cancelled` or `Depleted`.
     pub fn batch_extend_ttl(env: Env, stream_ids: Vec<u64>) -> Result<u32, Error> {
         // Authorization: permissionless — same policy as `extend_stream_ttl`.
         let stream_ids = Self::validate_batch_ids(&env, &stream_ids)?;
@@ -1523,6 +1679,14 @@ impl FluxoraStream {
         let mut extended = 0u32;
         for stream_id in stream_ids.iter() {
             if let Ok(stream) = storage::peek_stream(&env, stream_id) {
+                // Reject the entire batch if any stream is terminal. This
+                // matches the single-stream policy and prevents a caller from
+                // inadvertently paying rent for settled records. Unknown ids
+                // are still skipped (keeper resilience), but a known-terminal
+                // id is an explicit error.
+                if stream.status.is_terminal() {
+                    return Err(Error::StreamTerminated);
+                }
                 let target = storage::ttl_target_ledgers(&env, &stream);
                 storage::extend_stream(&env, stream_id, &stream);
                 events::ttl_extended(&env, stream_id, target);
